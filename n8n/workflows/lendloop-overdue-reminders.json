@@ -1,0 +1,254 @@
+{
+  "id": "lendloopRemind01",
+  "name": "LendLoop: overdue reminders",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      },
+      "id": "f606cb04-85a6-5f1e-864c-22bdfd2108d7",
+      "name": "Every day at 09:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "0fe36433-7e8e-5b47-82c1-be4957312ed8",
+      "name": "Run now (manual / CLI)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        480
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}.${body}`, verified by convex/http.ts.\nfunction signForLendLoop(payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');\n  return { body, timestamp, signature: `v1=${mac}` };\n}\n\nreturn [{ json: signForLendLoop({}) }];\n"
+      },
+      "id": "9fd1cfec-9697-526a-b775-7fba9d8ae876",
+      "name": "Sign overdue query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL }}/n8n/overdue-loans",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "db3f875e-3844-5fca-96f2-98d827ef6d00",
+      "name": "Fetch overdue loans",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per overdue loan. Convex already excluded loans reminded today.\nconst { loans = [] } = $input.first().json;\nreturn loans.map((loan) => ({ json: loan }));\n"
+      },
+      "id": "b3646741-8542-5982-bc86-5a85bafb4a9d",
+      "name": "One item per loan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// MOCK CHANNEL (see \"Send notification (mock)\" in the loan events workflow).\n// Each reminder is handled on its own: one failure is recorded as `failed`\n// for that loan instead of aborting the whole batch.\nreturn $input.all().map(({ json: loan }) => {\n  const masked = loan.borrowerEmail.replace(/^(.).*(@.*)$/, '$1***$2');\n  try {\n    if ($env.SIMULATE_NOTIFY_FAILURE === 'true') throw new Error('Simulated notification channel outage');\n    const days = loan.daysOverdue === 1 ? '1 day' : `${loan.daysOverdue} days`;\n    console.log(`[lendloop] reminder to ${masked}: Hi ${loan.borrowerName}, the ${loan.toolName} was due back ${days} ago.`);\n    return { json: { loanId: loan.loanId, reminderKey: loan.reminderKey, status: 'sent', channel: 'mock' } };\n  } catch (error) {\n    return {\n      json: {\n        loanId: loan.loanId,\n        reminderKey: loan.reminderKey,\n        status: 'failed',\n        channel: 'mock',\n        detail: String(error.message).slice(0, 200),\n      },\n    };\n  }\n});\n"
+      },
+      "id": "c384aded-01ce-53ba-9a07-debc6f1eeda2",
+      "name": "Send reminder (mock)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}.${body}`, verified by convex/http.ts.\nfunction signForLendLoop(payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');\n  return { body, timestamp, signature: `v1=${mac}` };\n}\n\n// reminderKey makes the write-back idempotent: retries can't duplicate it.\nreturn $input.all().map(({ json: r }) => ({\n  json: signForLendLoop({\n    loanId: r.loanId,\n    reminderKey: r.reminderKey,\n    status: r.status,\n    channel: r.channel,\n    ...(r.detail ? { detail: r.detail } : {}),\n  }),\n}));\n"
+      },
+      "id": "3618407f-944b-5020-a161-203fbc707a93",
+      "name": "Sign write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CONVEX_SITE_URL }}/n8n/reminders",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-lendloop-timestamp",
+              "value": "={{ $json.timestamp }}"
+            },
+            {
+              "name": "x-lendloop-signature",
+              "value": "={{ $json.signature }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "46819cad-344e-5e22-a387-6c8599fd1d77",
+      "name": "Record reminder in LendLoop",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1320,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Every day at 09:00": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign overdue query": {
+      "main": [
+        [
+          {
+            "node": "Fetch overdue loans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch overdue loans": {
+      "main": [
+        [
+          {
+            "node": "One item per loan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "One item per loan": {
+      "main": [
+        [
+          {
+            "node": "Send reminder (mock)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send reminder (mock)": {
+      "main": [
+        [
+          {
+            "node": "Sign write-back",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sign write-back": {
+      "main": [
+        [
+          {
+            "node": "Record reminder in LendLoop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run now (manual / CLI)": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "errorWorkflow": "lendloopErrors01"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
