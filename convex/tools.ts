@@ -5,6 +5,7 @@ import { categoryValidator, conditionValidator } from "./schema";
 import { assertOwnsTool, displayName, fail, requireViewer } from "./lib/auth";
 import { LIMITS } from "./lib/constants";
 import { todayIso } from "./lib/dates";
+import { assertCanCreateListing } from "./lib/limits";
 import { enqueueLoanNotification } from "./notifications";
 
 // Bounded reads keep every query cheap. A production build would paginate.
@@ -135,6 +136,7 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const viewer = await requireViewer(ctx);
     const { name, description } = cleanToolInput(args);
+    await assertCanCreateListing(ctx, viewer._id);
     return await ctx.db.insert("tools", {
       ownerId: viewer._id,
       name,

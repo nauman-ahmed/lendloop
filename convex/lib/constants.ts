@@ -46,4 +46,11 @@ export const LIMITS = {
   toolDescription: 500,
   maxLoanDays: 30,
   maxAdvanceBookingDays: 90,
+  // Abuse limits: every request notifies a lender, so these cap how much
+  // notification traffic (and data) one account can generate.
+  maxRequestsPerHour: 10,
+  maxOpenRequestsPerBorrower: 10,
+  maxOpenRequestsPerTool: 15,
+  maxListingsPerHour: 10,
+  maxListingsPerUser: 50,
 } as const;

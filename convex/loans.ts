@@ -3,6 +3,7 @@ import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { displayName, fail, requireViewer } from "./lib/auth";
 import { rangesOverlap, todayIso, validateLoanRange } from "./lib/dates";
+import { assertCanRequestLoan } from "./lib/limits";
 import { enqueueLoanNotification } from "./notifications";
 
 // Loan lifecycle:
@@ -42,6 +43,7 @@ export const request = mutation({
     const tool = await ctx.db.get(toolId);
     if (!tool) fail("NOT_FOUND", "That listing no longer exists.");
     if (tool.ownerId === viewer._id) fail("INVALID_INPUT", "You can't borrow your own tool.");
+    await assertCanRequestLoan(ctx, viewer._id, toolId);
 
     const rangeError = validateLoanRange(startDate, endDate);
     if (rangeError) fail("INVALID_INPUT", rangeError);

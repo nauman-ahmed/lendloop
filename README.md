@@ -43,6 +43,11 @@ auto-declines overlapping pending requests. A listing with an active loan
 can't be deleted by its owner. Deleting a listing cancels its pending
 requests and notifies the borrowers.
 
+Abuse limits (also server-side, since every request notifies a lender):
+at most 10 borrow requests per hour and 10 unanswered requests per
+borrower, at most 15 pending requests per tool (even across accounts),
+and at most 10 new listings per hour and 50 in total per user.
+
 ---
 
 ## Local setup
@@ -67,7 +72,9 @@ npm install
    **Convex integration** or create a **JWT template** named `convex`.
 3. Make sure the token carries the claims LendLoop reads: `name`, `email` and
    `email_verified`. The `convex` JWT template preset includes them. With the
-   native integration, add them under *Sessions → Customize session token*:
+   native integration, add them under *Sessions → Customize session token*.
+   **`email_verified` is required:** an address is only stored, and only
+   receives notifications, when the token says it is verified.
    ```json
    { "name": "{{user.full_name}}", "email": "{{user.primary_email_address}}", "email_verified": "{{user.email_verified}}" }
    ```
@@ -100,8 +107,11 @@ npx convex env set N8N_NOTIFY_WEBHOOK_URL http://localhost:5678/webhook/lendloop
 
 > `N8N_NOTIFY_WEBHOOK_URL` must be reachable **from the Convex backend**.
 > `localhost` works with a local Convex backend. A cloud deployment needs a
-> public URL for n8n, e.g. `cloudflared tunnel --url http://localhost:5678`,
-> or n8n Cloud.
+> public URL. Expose the **webhook gateway** on port 8080, never n8n's own
+> port 5678: the gateway forwards only `POST /webhook/lendloop-loan-events`
+> and returns 404 for the editor, the API and everything else. For example,
+> run `cloudflared tunnel --url http://localhost:8080` and set
+> `N8N_NOTIFY_WEBHOOK_URL` to `https://<tunnel-host>/webhook/lendloop-loan-events`.
 
 ### 4. Next.js
 
@@ -115,10 +125,15 @@ Open <http://localhost:3000> and sign in once.
 
 ### 5. Make yourself an admin and add demo data
 
-Roles can only be changed with deployment credentials, never from the browser:
+Roles can only be changed with deployment credentials, never from the
+browser. Accounts are addressed by id, not email. Find yours:
 
 ```bash
-npx convex run admin:setRole '{"email":"you@example.com","role":"admin"}'
+npx convex run admin:listAccounts
+```
+
+```bash
+npx convex run admin:setRole '{"userId":"<your userId>","role":"admin"}'
 ```
 
 ```bash
@@ -134,9 +149,15 @@ the reserved `example.com` domain.
 cp n8n/.env.example n8n/.env
 ```
 
+Create the key that encrypts n8n's stored credentials. It's a Docker secret
+file rather than an environment variable, so workflows can't read it:
+
+```bash
+openssl rand -hex 32 > n8n/secrets/n8n_encryption_key
+```
+
 Fill in `n8n/.env`:
 
-- `N8N_ENCRYPTION_KEY`: a new random value (`openssl rand -hex 32`).
 - `LENDLOOP_TO_N8N_SECRET` and `N8N_TO_LENDLOOP_SECRET`: the same values you set on Convex. Read them back with `npx convex env get <NAME>`.
 - `CONVEX_SITE_URL`: your Convex **HTTP actions** URL (`https://<deployment>.convex.site`), or `http://host.docker.internal:3211` for a local backend.
 
@@ -146,7 +167,13 @@ docker compose -f n8n/docker-compose.yml up -d
 
 On first start a one-shot `n8n-import` container imports **and publishes** the
 three workflows from `n8n/workflows/`. Open <http://localhost:5678> and create
-the n8n owner account.
+the n8n owner account. Keep it the only account that can edit workflows (see
+[Security of the integration](#security-of-the-integration)).
+
+| Service | Address | Purpose |
+| --- | --- | --- |
+| `n8n` | `127.0.0.1:5678` | Editor, API and webhooks. Local only. |
+| `webhook-gateway` (Caddy) | `127.0.0.1:8080` | The only thing to expose publicly: forwards `POST /webhook/lendloop-loan-events` (≤ 64 KB) and nothing else. |
 
 ### 7. Try the automations
 
@@ -177,11 +204,12 @@ the n8n owner account.
 | `N8N_TO_LENDLOOP_SECRET` | Convex env **and** `n8n/.env` | HMAC key for n8n → Convex HTTP endpoints. |
 | `N8N_NOTIFY_WEBHOOK_URL` | Convex env | n8n production webhook URL for loan events. |
 | `CONVEX_SITE_URL` | `n8n/.env` | Convex HTTP actions base URL. |
-| `N8N_ENCRYPTION_KEY` | `n8n/.env` | Encrypts n8n's credential store. |
+| `n8n_encryption_key` | `n8n/secrets/` (Docker secret file) | Encrypts n8n's credential store. Mounted as a file via `N8N_ENCRYPTION_KEY_FILE`, so it's not in the environment and workflows can't read it. |
 | `GENERIC_TIMEZONE` | `n8n/.env` | Timezone for the daily schedule (default UTC). |
 | `SIMULATE_NOTIFY_FAILURE` | `n8n/.env` (optional) | `true` makes the mock channels throw, to demo retries and error handling. |
 
-All `.env*` files except the `.env.example` templates are git-ignored. Exported
+All `.env*` files except the `.env.example` templates, and everything in
+`n8n/secrets/`, are git-ignored. Exported
 workflow JSON only references `$env.<NAME>`. No secret appears in the repository.
 
 ---
@@ -230,6 +258,7 @@ convex/
   lib/auth.ts            getViewer / requireViewer / requireAdmin / assertOwnsTool
   lib/signing.ts         HMAC sign/verify (timestamped, constant-time)
   lib/dates.ts           loan date rules
+  lib/limits.ts          per-account abuse limits
   users.ts tools.ts loans.ts admin.ts
   notifications.ts       outbox → signed webhook → retry/backoff
   automation.ts          internal functions behind the n8n endpoints
@@ -238,7 +267,8 @@ convex/
   *.test.ts              convex-test suites
 middleware.ts            Clerk route protection for /dashboard
 n8n/
-  docker-compose.yml     n8n + one-shot import/publish
+  docker-compose.yml     n8n + one-shot import/publish + webhook gateway
+  Caddyfile              gateway: only the loan-events webhook is public
   workflows/*.json       exported workflows
 ```
 
@@ -269,7 +299,7 @@ ended before today" directly.
 - **What each role can do:**
   - `user`: create, edit and delete *own* listings. Request loans. Cancel *own* requests. Approve, decline or mark returned only on loans for *own* tools.
   - `admin`: remove *any* listing (pending requests are cancelled and borrowers notified), view all loans and users, toggle Trusted Lender, see automation failures. Admins deliberately can't edit other people's listings or act on their loans. Moderation means removal, not impersonation.
-- **No self-elevation.** `users.ensureViewer` creates or refreshes the user from the verified JWT but never touches `role` or `trustedLender`. Roles change only through `admin:setRole`, an **internal** mutation that clients can't call, run with deployment credentials (CLI or dashboard).
+- **No self-elevation.** `users.ensureViewer` creates or refreshes the user from the verified JWT but never touches `role` or `trustedLender`. Roles change only through `admin:setRole`, an **internal** mutation that clients can't call, run with deployment credentials (CLI or dashboard). It takes a user **id**, not an email, so a look-alike or unverified address can't get the wrong account promoted.
 - **Why roles live in Convex rather than Clerk metadata:** the data and the checks live in the same place, changes take effect immediately (no token refresh), and a single source of truth is easy to audit. Mirroring the role into Clerk `publicMetadata` for SSR would be a reasonable addition.
 - **Typed errors.** Functions throw `ConvexError({ code, message })` (`UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `INVALID_INPUT`, `CONFLICT`), which the UI shows inline.
 
@@ -336,7 +366,9 @@ change. The composed message already contains only what the recipient needs.
 - **Two secrets, one per direction.** A leak on one side doesn't let an attacker forge the other.
 - Signatures cover a timestamp, which limits replay to a 5-minute window. n8n deduplicates `eventId`s and Convex is idempotent, so a replay inside the window changes nothing.
 - Convex's endpoints return a generic 401 and log the specific reason only server-side. Bodies are validated with zod after verification.
-- Secrets live in Convex env vars and `n8n/.env`. Code nodes read them via `$env`, so the exported JSON has none. In n8n 2.x this needs `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`, which means anyone who can *edit* workflows can read them. That's acceptable for a single-admin instance. For production, see below.
+- Secrets live in Convex env vars and `n8n/.env`. Code nodes read the two HMAC secrets via `$env`, so the exported JSON has none. In n8n 2.x this needs `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`, which lets anyone who can *edit* workflows read those two values. Keep workflow-edit rights to the owner account.
+- n8n's credential-encryption key is **not** in the environment. It's a Docker secret file (`N8N_ENCRYPTION_KEY_FILE`). Verified with a probe workflow: `$env` doesn't expose it, the Read/Write Files node is refused access to the file, and `require('fs')` is disallowed in Code nodes.
+- Only the webhook is public. n8n binds to localhost, and the Caddy gateway forwards nothing but `POST /webhook/lendloop-loan-events`, with a 64 KB body cap.
 
 ---
 
@@ -346,7 +378,8 @@ change. The composed message already contains only what the recipient needs.
 - **Between users:** other people appear by **first name only**. Emails are never returned to any client, admins included. Users coordinate through notifications, not by exchanging contact details.
 - **To n8n:** payloads include only the recipient's first name and email, the other party's first name and loan facts. No user ids beyond the loan id, no other party's email, no descriptions.
 - **Inside n8n:** logs mask addresses (`b***@example.com`). The error workflow strips email addresses from error messages before sending them to Convex. Execution data is pruned after 7 days.
-- **Unverified emails** (`email_verified: false` in the token) are not stored, so notifications can't be pointed at someone else's address.
+- **Only verified emails are stored.** An address is kept only when the token says `email_verified: true`. A missing claim counts as unverified, so notifications can't be pointed at someone else's address.
+- **Abuse limits** on requests and listings (see [What it does](#what-it-does)) stop one account from flooding a lender with notifications.
 - **Input validation:** Convex validators on every argument, with length limits on text, strict calendar-date parsing, and enum categories, conditions and roles.
 - **Defence in depth:** Clerk middleware protects `/dashboard`, but every function also checks auth independently.
 - **Supply chain / runtime:** React pinned to a patched 19.1.x. The n8n image is pinned to a fixed version and n8n is bound to `127.0.0.1` in compose. n8n telemetry is off.
@@ -356,7 +389,7 @@ change. The composed message already contains only what the recipient needs.
 ## Testing
 
 ```bash
-npm test            # 25 tests: unit (dates, HMAC) + convex-test integration
+npm test            # 32 tests: unit (dates, HMAC) + convex-test integration
 ```
 
 ```bash
@@ -375,6 +408,8 @@ functions in memory as different identities. It covers:
 - Users can't edit, delete or act on others' listings and loans. Admins can remove any listing. Users can't self-promote, and admin functions reject users.
 - The lifecycle rules work: double booking is blocked, overlapping requests are auto-declined, and you can't borrow your own tool.
 - Loan views never contain emails.
+- Emails are stored only when verified (a missing claim counts as unverified), and roles are granted by user id.
+- Abuse limits: hourly and open-request caps per borrower, a per-tool pending cap across accounts, and hourly and total listing caps.
 - Each transition sends exactly one **signed** webhook with a minimal payload.
 - 5xx responses are retried 5× then marked failed and shown to admins. 4xx responses aren't retried.
 - n8n endpoints reject bad signatures. The overdue list is minimal, and reminder write-backs are idempotent and scoped to their loan.
@@ -385,6 +420,8 @@ I also ran the whole loop against a real n8n 2.47.5 container:
 - **Signed webhook:** 200. **Replay:** "duplicate". **Bad, stale or tampered signature:** 401.
 - **Reminders, run twice:** created, then nothing to do.
 - **Simulated outage:** Convex retries and the error workflow records each failed run. Recovery happens on the next retry.
+- **Webhook gateway:** the signed webhook passes. The editor, `/rest`, `/api`, other webhooks, `/webhook-test` and `../` traversal all return 404, and a 70 KB body returns 413.
+- **Secret isolation:** a probe Code node can't see the encryption key in `$env`, can't read its file with the Read/Write Files node, and can't load `fs`.
 
 ---
 
@@ -392,7 +429,7 @@ I also ran the whole loop against a real n8n 2.47.5 container:
 
 **Secrets and keys**
 
-- Move n8n secrets from `$env` to n8n **External Secrets** (Vault / AWS Secrets Manager) and re-enable `N8N_BLOCK_ENV_ACCESS_IN_NODE`.
+- Move the two HMAC secrets from `$env` to n8n **External Secrets** (Vault / AWS Secrets Manager) and re-enable `N8N_BLOCK_ENV_ACCESS_IN_NODE`.
 - Rotate the HMAC secrets on a schedule. Support two active keys during rotation (`v1=` and `v2=` signatures).
 
 **n8n**
@@ -413,7 +450,7 @@ I also ran the whole loop against a real n8n 2.47.5 container:
 
 **Abuse and auditing**
 
-- Rate-limit request creation per user (e.g. `@convex-dev/rate-limiter`). Add content moderation for listing text.
+- Move the fixed abuse limits to a token-bucket limiter (e.g. `@convex-dev/rate-limiter`) with per-lender limits, and let lenders block a borrower. Add content moderation for listing text.
 - Write an audit log for admin actions (who removed which listing, who changed trust or roles, and when).
 
 **Observability and delivery**

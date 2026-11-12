@@ -1,5 +1,5 @@
 import { v } from "convex/values";
-import { internalMutation, mutation, query } from "./_generated/server";
+import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import { displayName, fail, requireAdmin } from "./lib/auth";
 import { todayIso } from "./lib/dates";
 
@@ -107,24 +107,35 @@ export const automationFailures = query({
 });
 
 /**
+ * Lists accounts so an operator can pick the right id for setRole:
+ *   npx convex run admin:listAccounts
+ */
+export const listAccounts = internalQuery({
+  args: {},
+  handler: async (ctx) => {
+    const users = await ctx.db.query("users").order("desc").take(500);
+    return users.map((user) => ({
+      userId: user._id,
+      name: user.name,
+      role: user.role,
+      createdAt: new Date(user._creationTime).toISOString(),
+    }));
+  },
+});
+
+/**
  * Role changes happen out-of-band, never from the browser:
- *   npx convex run admin:setRole '{"email":"you@example.com","role":"admin"}'
- * Internal functions can only be invoked with deployment credentials.
+ *   npx convex run admin:setRole '{"userId":"<id from listAccounts>","role":"admin"}'
+ * Internal functions can only be invoked with deployment credentials. Accounts
+ * are addressed by id, not email: an email is a user-supplied attribute, the
+ * id is not, so the wrong account can't be promoted by a look-alike address.
  */
 export const setRole = internalMutation({
-  args: { email: v.string(), role: v.union(v.literal("admin"), v.literal("user")) },
-  handler: async (ctx, { email, role }) => {
-    const matches = (await ctx.db.query("users").collect()).filter(
-      (user) => user.email?.toLowerCase() === email.toLowerCase(),
-    );
-    if (matches.length !== 1) {
-      throw new Error(
-        matches.length === 0
-          ? `No user with email ${email}. Sign in once first so the account exists.`
-          : `Several users share ${email}; refusing to guess.`,
-      );
-    }
-    await ctx.db.patch(matches[0]._id, { role });
-    return `${displayName(matches[0])} is now ${role}`;
+  args: { userId: v.id("users"), role: v.union(v.literal("admin"), v.literal("user")) },
+  handler: async (ctx, { userId, role }) => {
+    const user = await ctx.db.get(userId);
+    if (!user) throw new Error(`No user with id ${userId}. Sign in once first so the account exists.`);
+    await ctx.db.patch(userId, { role });
+    return `${displayName(user)} is now ${role}`;
   },
 });

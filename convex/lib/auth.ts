@@ -12,7 +12,8 @@ export type ErrorCode =
   | "FORBIDDEN"
   | "NOT_FOUND"
   | "INVALID_INPUT"
-  | "CONFLICT";
+  | "CONFLICT"
+  | "RATE_LIMITED";
 
 export function fail(code: ErrorCode, message: string): never {
   throw new ConvexError({ code, message });

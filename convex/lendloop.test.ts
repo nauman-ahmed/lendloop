@@ -31,6 +31,7 @@ async function setup() {
       subject: name,
       name,
       email,
+      emailVerified: true,
     });
     const id = await client.mutation(api.users.ensureViewer, {});
     return Object.assign(client, { id });
@@ -39,7 +40,7 @@ async function setup() {
   const borrower = await as("Bo Borrower", "bo@example.com");
   const other = await as("Ola Other", "ola@example.com");
   const admin = await as("Ada Admin", "ada@example.com");
-  await t.mutation(internal.admin.setRole, { email: "ada@example.com", role: "admin" });
+  await t.mutation(internal.admin.setRole, { userId: admin.id, role: "admin" });
 
   const toolId = await lender.mutation(api.tools.create, {
     name: "Cordless drill",
@@ -204,6 +205,127 @@ describe("loan lifecycle", () => {
     const [incoming] = await lender.query(api.loans.incoming, {});
     expect(JSON.stringify(incoming)).not.toContain("@example.com");
     expect(incoming.counterpartName).toBe("Bo"); // first name only
+  });
+});
+
+describe("email verification (LL-04)", () => {
+  test("an email is only stored when the token says it is verified", async () => {
+    const { t } = await setup();
+    const cases = [
+      { subject: "unverified", emailVerified: false },
+      { subject: "no-claim", emailVerified: undefined },
+      { subject: "verified", emailVerified: true },
+    ];
+    for (const { subject, emailVerified } of cases) {
+      const client = t.withIdentity({
+        tokenIdentifier: `test|${subject}`,
+        subject,
+        name: subject,
+        email: `${subject}@example.com`,
+        ...(emailVerified === undefined ? {} : { emailVerified }),
+      });
+      const id = await client.mutation(api.users.ensureViewer, {});
+      const user = await t.run((ctx) => ctx.db.get(id));
+      expect(user?.email).toBe(emailVerified === true ? `${subject}@example.com` : undefined);
+    }
+  });
+
+  test("an account that loses verification stops receiving mail", async () => {
+    const { t } = await setup();
+    const verified = t.withIdentity({ tokenIdentifier: "test|flip", subject: "flip", name: "Flip", email: "flip@example.com", emailVerified: true });
+    const id = await verified.mutation(api.users.ensureViewer, {});
+    const unverified = t.withIdentity({ tokenIdentifier: "test|flip", subject: "flip", name: "Flip", email: "attacker@example.com", emailVerified: false });
+    await unverified.mutation(api.users.ensureViewer, {});
+    expect((await t.run((ctx) => ctx.db.get(id)))?.email).toBeUndefined();
+  });
+
+  test("roles are granted by user id, not by email", async () => {
+    const { t, other } = await setup();
+    const accounts = await t.query(internal.admin.listAccounts, {});
+    expect(accounts.map((a) => a.userId)).toContain(other.id);
+    await t.mutation(internal.admin.setRole, { userId: other.id, role: "admin" });
+    expect((await other.query(api.users.me, {}))?.role).toBe("admin");
+  });
+});
+
+describe("abuse limits (LL-03)", () => {
+  type Client = Awaited<ReturnType<typeof setup>>["lender"];
+
+  async function addTools(owner: Client, count: number) {
+    const ids: Id<"tools">[] = [];
+    for (let i = 0; i < count; i++) {
+      ids.push(
+        await owner.mutation(api.tools.create, {
+          name: `Tool ${i}`,
+          category: "other",
+          condition: "good",
+          description: "",
+        }),
+      );
+    }
+    return ids;
+  }
+
+  /** 11 tools from two lenders, staying under the hourly listing limit. */
+  async function elevenTools({ lender, other, toolId }: Awaited<ReturnType<typeof setup>>) {
+    return [toolId, ...(await addTools(lender, 9)), ...(await addTools(other, 1))];
+  }
+
+  const borrowTomorrow = (client: Client, toolId: Id<"tools">) =>
+    client.mutation(api.loans.request, { toolId, startDate: "2026-06-11", endDate: "2026-06-11" });
+
+  test("a borrower can send at most 10 requests per hour", async () => {
+    const ctx = await setup();
+    const { borrower } = ctx;
+    const tools = await elevenTools(ctx);
+    for (const toolId of tools.slice(0, 10)) {
+      const loanId = await borrowTomorrow(borrower, toolId);
+      await borrower.mutation(api.loans.cancel, { loanId }); // isolate the hourly limit
+    }
+    await expectError(borrowTomorrow(borrower, tools[10]), "RATE_LIMITED");
+
+    vi.setSystemTime(new Date("2026-06-10T13:01:00Z"));
+    await borrowTomorrow(borrower, tools[10]);
+  });
+
+  test("a borrower can have at most 10 unanswered requests", async () => {
+    const ctx = await setup();
+    const { borrower } = ctx;
+    const tools = await elevenTools(ctx);
+    for (const [i, toolId] of tools.slice(0, 10).entries()) {
+      if (i === 5) vi.setSystemTime(new Date("2026-06-10T13:01:00Z")); // stay under the hourly limit
+      await borrowTomorrow(borrower, toolId);
+    }
+    await expectError(borrowTomorrow(borrower, tools[10]), "RATE_LIMITED");
+
+    const [newest] = await borrower.query(api.loans.myRequests, {});
+    await borrower.mutation(api.loans.cancel, { loanId: newest._id });
+    await borrowTomorrow(borrower, tools[10]);
+  });
+
+  test("one tool can have at most 15 pending requests, even from many accounts", async () => {
+    const { t, toolId } = await setup();
+    const borrowers = [];
+    for (let i = 0; i < 16; i++) {
+      const client = t.withIdentity({ tokenIdentifier: `test|b${i}`, subject: `b${i}`, name: `B ${i}` });
+      await client.mutation(api.users.ensureViewer, {});
+      borrowers.push(client);
+    }
+    for (const client of borrowers.slice(0, 15)) await borrowTomorrow(client as Client, toolId);
+    await expectError(borrowTomorrow(borrowers[15] as Client, toolId), "RATE_LIMITED");
+  });
+
+  test("a user can list at most 10 tools per hour and 50 in total", async () => {
+    const { other } = await setup();
+    await addTools(other, 10);
+    await expectError(addTools(other, 1), "RATE_LIMITED");
+
+    for (let hour = 1; hour <= 4; hour++) {
+      vi.setSystemTime(new Date(Date.parse("2026-06-10T12:00:00Z") + hour * 61 * 60 * 1000));
+      await addTools(other, 10);
+    }
+    vi.setSystemTime(new Date("2026-06-10T20:00:00Z"));
+    await expectError(addTools(other, 1), "RATE_LIMITED"); // 50 listings, hourly window clear
   });
 });
 

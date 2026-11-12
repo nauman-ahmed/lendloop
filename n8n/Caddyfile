@@ -1,0 +1,26 @@
+# Public entry point for n8n. Only the one webhook Convex calls is reachable;
+# the editor, REST API and every other path return 404. Point a tunnel or
+# load balancer at this gateway (port 8080), never at n8n itself.
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	# Loan events are tiny; refuse anything that isn't.
+	request_body {
+		max_size 64KB
+	}
+
+	@loanEvents {
+		method POST
+		path /webhook/lendloop-loan-events
+	}
+	handle @loanEvents {
+		reverse_proxy n8n:5678
+	}
+
+	handle {
+		respond 404
+	}
+}

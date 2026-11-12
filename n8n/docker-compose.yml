@@ -1,14 +1,24 @@
 # Self-hosted n8n for LendLoop.
 #
-#   cp .env.example .env        # then fill in the secrets
+#   cp .env.example .env                                   # then fill in the secrets
+#   openssl rand -hex 32 > secrets/n8n_encryption_key
 #   docker compose up -d
 #
 # On first start `n8n-import` imports and publishes the workflows in ./workflows,
 # then n8n starts. Open http://localhost:5678 and create the owner account.
+#
+# Exposure: n8n (editor + API) listens on 127.0.0.1:5678 only. `webhook-gateway`
+# on 127.0.0.1:8080 forwards *only* POST /webhook/lendloop-loan-events. If Convex
+# must reach n8n from the internet, expose the gateway, never port 5678.
 
 x-n8n-env: &n8n-env
-  # --- secrets (from .env, never committed) -------------------------------
-  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in n8n/.env}
+  # --- secrets (never committed) ------------------------------------------
+  # The credential-encryption key is read from a Docker secret file, so it is not
+  # an environment variable and Code nodes cannot read it through $env.
+  N8N_ENCRYPTION_KEY_FILE: /run/secrets/n8n_encryption_key
+  # The two HMAC secrets are the only secrets in the environment: Code nodes need
+  # them to sign and verify. Anyone who can edit workflows can read them, so keep
+  # workflow-edit rights to the owner account.
   LENDLOOP_TO_N8N_SECRET: ${LENDLOOP_TO_N8N_SECRET:?set LENDLOOP_TO_N8N_SECRET in n8n/.env}
   N8N_TO_LENDLOOP_SECRET: ${N8N_TO_LENDLOOP_SECRET:?set N8N_TO_LENDLOOP_SECRET in n8n/.env}
   # --- integration config ---------------------------------------------------
@@ -20,7 +30,6 @@ x-n8n-env: &n8n-env
   TZ: ${GENERIC_TIMEZONE:-UTC}
   WEBHOOK_URL: ${N8N_PUBLIC_URL:-http://localhost:5678/}
   # Code nodes read the two signing secrets via $env and use node:crypto for HMAC.
-  # Only workflow editors can read $env, so restrict who can edit workflows.
   N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
   NODE_FUNCTION_ALLOW_BUILTIN: crypto
   N8N_RUNNERS_ENABLED: "true"
@@ -34,6 +43,7 @@ services:
   n8n-import:
     image: docker.n8n.io/n8nio/n8n:2.47.5
     environment: *n8n-env
+    secrets: [n8n_encryption_key]
     volumes:
       - n8n_data:/home/node/.n8n
       - ./workflows:/workflows:ro
@@ -58,11 +68,25 @@ services:
     ports:
       - "127.0.0.1:5678:5678"
     environment: *n8n-env
+    secrets: [n8n_encryption_key]
     volumes:
       - n8n_data:/home/node/.n8n
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+  webhook-gateway:
+    image: caddy:2.11.9
+    depends_on: [n8n]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    restart: unless-stopped
+
+secrets:
+  n8n_encryption_key:
+    file: ./secrets/n8n_encryption_key
 
 volumes:
   n8n_data:

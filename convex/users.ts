@@ -18,7 +18,9 @@ export const ensureViewer = mutation({
       identity.nickname?.trim() ||
       identity.email?.split("@")[0] ||
       "Neighbour";
-    const email = identity.emailVerified === false ? undefined : identity.email;
+    // Fail closed: only an address the identity provider says is verified is
+    // used for notifications. A missing `email_verified` claim counts as unverified.
+    const email = identity.emailVerified === true ? identity.email : undefined;
 
     const existing = await getViewer(ctx);
     if (existing) {
