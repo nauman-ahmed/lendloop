@@ -25,7 +25,9 @@ export default function RootLayout({
   return (
     <ClerkProvider dynamic>
       <html lang="en">
-        <body className={`${geistSans.variable} antialiased`}>
+        {/* Browser extensions (e.g. Grammarly) add attributes to <body> before
+            React hydrates; ignore that one-level mismatch instead of warning. */}
+        <body className={`${geistSans.variable} antialiased`} suppressHydrationWarning>
           <Providers>{children}</Providers>
         </body>
       </html>

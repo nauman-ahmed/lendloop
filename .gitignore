@@ -44,3 +44,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Clerk keyless mode (local dev without keys): holds a temporary secret key
+/.clerk/
