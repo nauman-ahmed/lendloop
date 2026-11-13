@@ -1,16 +1,22 @@
 "use client";
 
 import { SignInButton } from "@clerk/nextjs";
-import { Authenticated, Unauthenticated, useQuery } from "convex/react";
+import { Authenticated, Unauthenticated, usePaginatedQuery } from "convex/react";
 import Link from "next/link";
 import { api } from "@/convex/_generated/api";
 import { CATEGORY_LABELS } from "@/convex/lib/constants";
 import { Header } from "@/components/Header";
-import { Badge, Button, EmptyState, Spinner } from "@/components/ui";
+import { Badge, Button, EmptyState, LoadMore, Spinner } from "@/components/ui";
+
+const PAGE_SIZE = 24;
 
 export default function HomePage() {
   // Public query: returns only name + category of currently available tools.
-  const tools = useQuery(api.tools.listPublic);
+  const { results: tools, status, loadMore } = usePaginatedQuery(
+    api.tools.listPublic,
+    {},
+    { initialNumItems: PAGE_SIZE },
+  );
 
   return (
     <>
@@ -46,12 +52,16 @@ export default function HomePage() {
         <section className="pb-20">
           <div className="mb-4 flex items-baseline justify-between">
             <h2 className="text-lg font-semibold text-stone-900">Available right now</h2>
-            {tools && <span className="text-sm text-stone-500">{tools.length} tools</span>}
+            {status !== "LoadingFirstPage" && (
+              <span className="text-sm text-stone-500">
+                {tools.length} {status === "Exhausted" ? "tools" : "shown"}
+              </span>
+            )}
           </div>
-          {tools === undefined ? (
+          {status === "LoadingFirstPage" ? (
             <Spinner />
-          ) : tools.length === 0 ? (
-            <EmptyState>No tools listed yet. Be the first to lend one!</EmptyState>
+          ) : tools.length === 0 && status === "Exhausted" ? (
+            <EmptyState>No tools available right now. Be the first to lend one!</EmptyState>
           ) : (
             <ul className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {tools.map((tool) => (
@@ -65,6 +75,7 @@ export default function HomePage() {
               ))}
             </ul>
           )}
+          <LoadMore status={status} loadMore={loadMore} pageSize={PAGE_SIZE} />
         </section>
       </main>
     </>

@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
-import { signPayload, verifySignature, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./lib/signing";
+import { NO_EMAIL_DETAIL, OVERDUE_PAGE_SIZE } from "./automation";
+import { signRequest, verifyRequest, SIGNATURE_HEADER, TIMESTAMP_HEADER } from "./lib/signing";
 
 const modules = import.meta.glob("./**/*.ts");
 const INBOUND_SECRET = "n8n-to-lendloop-test-secret";
@@ -51,6 +52,8 @@ async function setup() {
   return { t, lender, borrower, other, admin, toolId };
 }
 
+const FIRST_PAGE = { paginationOpts: { numItems: 20, cursor: null } };
+
 const expectError = async (promise: Promise<unknown>, code: string) => {
   await expect(promise).rejects.toMatchObject({ data: expect.objectContaining({ code }) });
 };
@@ -58,14 +61,52 @@ const expectError = async (promise: Promise<unknown>, code: string) => {
 describe("public catalogue", () => {
   test("exposes only name and category, no owner details", async () => {
     const { t } = await setup();
-    const tools = await t.query(api.tools.listPublic, {});
+    const { page: tools } = await t.query(api.tools.listPublic, FIRST_PAGE);
     expect(tools).toHaveLength(1);
     expect(Object.keys(tools[0]).sort()).toEqual(["category", "id", "name"]);
   });
 
+  test("is paged, and every tool is reachable through the cursor", async () => {
+    const { t, lender } = await setup();
+    for (let i = 0; i < 4; i++) {
+      await lender.mutation(api.tools.create, { name: `Rake ${i}`, category: "garden", condition: "good", description: "" });
+    }
+    const names: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const result: { page: { name: string }[]; isDone: boolean; continueCursor: string } = await t.query(
+        api.tools.listPublic,
+        { paginationOpts: { numItems: 2, cursor } },
+      );
+      expect(result.page.length).toBeLessThanOrEqual(2);
+      names.push(...result.page.map((tool) => tool.name));
+      cursor = result.isDone ? null : result.continueCursor;
+    } while (cursor);
+    expect(names).toHaveLength(5);
+  });
+
+  test("caps the page size a caller can ask for", async () => {
+    const { t, lender } = await setup();
+    for (let i = 0; i < 55; i++) {
+      await t.run((ctx) =>
+        ctx.db.insert("tools", {
+          ownerId: lender.id,
+          name: `Spade ${i}`,
+          category: "garden",
+          condition: "good",
+          description: "",
+          updatedAt: Date.now(),
+        }),
+      );
+    }
+    const { page, isDone } = await t.query(api.tools.listPublic, { paginationOpts: { numItems: 10_000, cursor: null } });
+    expect(page).toHaveLength(50);
+    expect(isDone).toBe(false);
+  });
+
   test("signed-out callers cannot use authenticated functions", async () => {
     const { t, toolId } = await setup();
-    await expectError(t.query(api.tools.list, {}), "UNAUTHENTICATED");
+    await expectError(t.query(api.tools.list, FIRST_PAGE), "UNAUTHENTICATED");
     await expectError(
       t.mutation(api.loans.request, { toolId, startDate: "2026-06-11", endDate: "2026-06-12" }),
       "UNAUTHENTICATED",
@@ -92,7 +133,7 @@ describe("listing ownership", () => {
   test("admins can remove any listing", async () => {
     const { t, admin, toolId } = await setup();
     await admin.mutation(api.tools.remove, { toolId });
-    expect(await t.query(api.tools.listPublic, {})).toHaveLength(0);
+    expect((await t.query(api.tools.listPublic, FIRST_PAGE)).page).toHaveLength(0);
   });
 
   test("owners cannot delete a tool that is out on loan", async () => {
@@ -129,7 +170,9 @@ describe("roles", () => {
   test("admins can mark a Trusted Lender, which shows on listings", async () => {
     const { admin, lender, borrower } = await setup();
     await admin.mutation(api.admin.setTrustedLender, { userId: lender.id, trusted: true });
-    const [tool] = await borrower.query(api.tools.list, {});
+    const {
+      page: [tool],
+    } = await borrower.query(api.tools.list, FIRST_PAGE);
     expect(tool.ownerTrusted).toBe(true);
   });
 });
@@ -355,9 +398,9 @@ describe("request notifications (Convex -> n8n)", () => {
     expect(approved.counterpartName).toBe("Lena");
     expect(calls[1].body).not.toContain("lena@example.com");
 
-    const verdict = await verifySignature(
+    const verdict = await verifyRequest(
       OUTBOUND_SECRET,
-      calls[1].body,
+      { method: "POST", path: "/webhook/lendloop-loan-events", body: calls[1].body },
       calls[1].headers.get(TIMESTAMP_HEADER),
       calls[1].headers.get(SIGNATURE_HEADER),
     );
@@ -392,11 +435,19 @@ describe("request notifications (Convex -> n8n)", () => {
 });
 
 describe("overdue reminders (n8n -> Convex)", () => {
-  async function signedPost(t: ReturnType<typeof convexTest>, path: string, body: unknown, secret = INBOUND_SECRET) {
+  async function signedPost(
+    t: ReturnType<typeof convexTest>,
+    path: string,
+    body: unknown,
+    { secret = INBOUND_SECRET, signedFor = path } = {},
+  ) {
     const raw = JSON.stringify(body);
     return t.fetch(path, {
       method: "POST",
-      headers: { "content-type": "application/json", ...(await signPayload(secret, raw)) },
+      headers: {
+        "content-type": "application/json",
+        ...(await signRequest(secret, { method: "POST", path: signedFor, body: raw })),
+      },
       body: raw,
     });
   }
@@ -418,16 +469,37 @@ describe("overdue reminders (n8n -> Convex)", () => {
     const { t } = await setup();
     const unsigned = await t.fetch("/n8n/overdue-loans", { method: "POST", body: "{}" });
     expect(unsigned.status).toBe(401);
-    const wrong = await signedPost(t, "/n8n/overdue-loans", {}, "not-the-secret");
+    const wrong = await signedPost(t, "/n8n/overdue-loans", {}, { secret: "not-the-secret" });
     expect(wrong.status).toBe(401);
+  });
+
+  test("a request signed for one endpoint is rejected by the others", async () => {
+    const { t, loanId } = await overdueLoan();
+    // This body was accepted by /n8n/overdue-loans before signatures covered the path.
+    const reminder = { loanId, reminderKey: `reminder:${loanId}:2026-06-15`, status: "sent", channel: "mock" };
+    const replayed = await signedPost(t, "/n8n/overdue-loans", reminder, { signedFor: "/n8n/reminders" });
+    expect(replayed.status).toBe(401);
+    const errorReplay = await signedPost(t, "/n8n/workflow-errors", {}, { signedFor: "/n8n/overdue-loans" });
+    expect(errorReplay.status).toBe(401);
+  });
+
+  test("bodies with unexpected keys are rejected, not silently trimmed", async () => {
+    const { t, loanId } = await overdueLoan();
+    const reminder = { loanId, reminderKey: `reminder:${loanId}:2026-06-15`, status: "sent", channel: "mock" };
+    expect((await signedPost(t, "/n8n/overdue-loans", reminder)).status).toBe(400);
+    expect((await signedPost(t, "/n8n/reminders", { ...reminder, extra: true })).status).toBe(400);
+    // A cursor is only meaningful together with the date it was issued for.
+    expect((await signedPost(t, "/n8n/overdue-loans", { cursor: "abc" })).status).toBe(400);
   });
 
   test("lists overdue loans with only the fields a reminder needs", async () => {
     const { t, loanId } = await overdueLoan();
     const response = await signedPost(t, "/n8n/overdue-loans", {});
     expect(response.status).toBe(200);
-    const { asOf, loans } = await response.json();
+    const { asOf, loans, undeliverable, nextCursor } = await response.json();
     expect(asOf).toBe("2026-06-15");
+    expect(undeliverable).toBe(0);
+    expect(nextCursor).toBeNull();
     expect(loans).toEqual([
       {
         loanId,
@@ -461,6 +533,59 @@ describe("overdue reminders (n8n -> Convex)", () => {
     const [view] = await borrower.query(api.loans.myRequests, {});
     expect(view.isOverdue).toBe(true);
     expect(view.activity.filter((a) => a.kind === "reminder")).toHaveLength(1);
+  });
+
+  test("overdue loans with no email are recorded as failed reminders, not skipped silently", async () => {
+    const { t, admin, borrower, loanId } = await overdueLoan();
+    await t.run((ctx) => ctx.db.patch(borrower.id, { email: undefined }));
+
+    for (let run = 1; run <= 2; run++) {
+      const body = await (await signedPost(t, "/n8n/overdue-loans", {})).json();
+      expect(body.loans).toEqual([]);
+      expect(body.undeliverable).toBe(1);
+    }
+
+    const failures = await admin.query(api.admin.automationFailures, {});
+    expect(failures).toEqual([
+      expect.objectContaining({ kind: "reminder", label: "overdue_reminder:none", detail: NO_EMAIL_DETAIL, attempts: 2 }),
+    ]);
+    const [view] = await borrower.query(api.loans.myRequests, {});
+    expect(view._id).toBe(loanId);
+    expect(view.activity).toContainEqual(expect.objectContaining({ kind: "reminder", status: "failed" }));
+  });
+
+  test("overdue loans are paged with a cursor so none are dropped", async () => {
+    const { t, loanId, toolId, lender, borrower } = await overdueLoan();
+    const extra = OVERDUE_PAGE_SIZE + 5;
+    await t.run(async (ctx) => {
+      for (let i = 0; i < extra; i++) {
+        await ctx.db.insert("loans", {
+          toolId,
+          toolName: "Cordless drill",
+          ownerId: lender.id,
+          borrowerId: borrower.id,
+          startDate: "2026-05-01",
+          endDate: "2026-05-02",
+          status: "approved",
+        });
+      }
+    });
+
+    const seen: string[] = [];
+    let request: { asOf?: string; cursor?: string } = {};
+    let pages = 0;
+    for (;;) {
+      const page = await (await signedPost(t, "/n8n/overdue-loans", request)).json();
+      pages++;
+      expect(page.loans.length).toBeLessThanOrEqual(OVERDUE_PAGE_SIZE);
+      seen.push(...page.loans.map((l: { loanId: string }) => l.loanId));
+      if (!page.nextCursor) break;
+      request = { asOf: page.asOf, cursor: page.nextCursor };
+    }
+    expect(pages).toBeGreaterThan(1);
+    expect(seen).toHaveLength(extra + 1);
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen).toContain(loanId);
   });
 
   test("a reminder key cannot be written against a different loan", async () => {

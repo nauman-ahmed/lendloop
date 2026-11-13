@@ -1,3 +1,4 @@
+import { paginationOptsValidator, type PaginationOptions } from "convex/server";
 import { v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
@@ -8,8 +9,16 @@ import { todayIso } from "./lib/dates";
 import { assertCanCreateListing } from "./lib/limits";
 import { enqueueLoanNotification } from "./notifications";
 
-// Bounded reads keep every query cheap. A production build would paginate.
+// A user's own listings are capped by LIMITS (see lib/limits.ts), so `mine`
+// can read them all. The shared catalogue grows without bound, so it is paged.
 const MAX_TOOLS = 200;
+// Callers choose the page size; this stops one request from reading a huge page.
+const MAX_PAGE_SIZE = 50;
+
+const boundedPage = (opts: PaginationOptions): PaginationOptions => ({
+  ...opts,
+  numItems: Math.max(1, Math.min(opts.numItems, MAX_PAGE_SIZE)),
+});
 
 type Booking = { startDate: string; endDate: string };
 
@@ -50,35 +59,36 @@ function cleanToolInput(input: { name: string; description: string }) {
  * that are currently available: no owner, condition, or description.
  */
 export const listPublic = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { paginationOpts: paginationOptsValidator },
+  handler: async (ctx, { paginationOpts }) => {
     const today = todayIso();
-    const tools = await ctx.db.query("tools").order("desc").take(MAX_TOOLS);
-    const result = [];
-    for (const tool of tools) {
+    const page = await ctx.db.query("tools").order("desc").paginate(boundedPage(paginationOpts));
+    const available = [];
+    for (const tool of page.page) {
       if (isOnLoan(await activeBookings(ctx, tool._id), today)) continue;
-      result.push({ id: tool._id, name: tool.name, category: tool.category });
+      available.push({ id: tool._id, name: tool.name, category: tool.category });
     }
-    return result;
+    // A page can come back short (tools on loan are left out); the cursor still advances.
+    return { ...page, page: available };
   },
 });
 
 /** Full catalogue for signed-in users, with availability and lender trust badge. */
 export const list = query({
-  args: { category: v.optional(categoryValidator) },
-  handler: async (ctx, { category }) => {
+  args: { category: v.optional(categoryValidator), paginationOpts: paginationOptsValidator },
+  handler: async (ctx, { category, paginationOpts }) => {
     const viewer = await requireViewer(ctx);
     const today = todayIso();
     const tools = category
-      ? await ctx.db
+      ? ctx.db
           .query("tools")
           .withIndex("by_category", (q) => q.eq("category", category))
           .order("desc")
-          .take(MAX_TOOLS)
-      : await ctx.db.query("tools").order("desc").take(MAX_TOOLS);
+      : ctx.db.query("tools").order("desc");
+    const page = await tools.paginate(boundedPage(paginationOpts));
 
-    return Promise.all(
-      tools.map(async (tool) => {
+    const items = await Promise.all(
+      page.page.map(async (tool) => {
         const owner = await ctx.db.get(tool.ownerId);
         const bookings = await activeBookings(ctx, tool._id);
         return {
@@ -95,6 +105,7 @@ export const list = query({
         };
       }),
     );
+    return { ...page, page: items };
   },
 });
 

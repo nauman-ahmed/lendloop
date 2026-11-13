@@ -36,7 +36,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}.${body}`, verified by convex/http.ts.\nfunction signForLendLoop(payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');\n  return { body, timestamp, signature: `v1=${mac}` };\n}\n\nreturn [{ json: signForLendLoop({}) }];\n"
+        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}\\n${method}\\n${path}\\n${body}`, verified by\n// convex/http.ts. The path is part of the MAC, so the signature is only valid\n// for the endpoint it was made for. The HTTP node posts to the returned `url`,\n// so the path signed and the path called can't drift apart.\nfunction signForLendLoop(path, payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  const baseUrl = $env.CONVEX_SITE_URL;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  if (!baseUrl) throw new Error('CONVEX_SITE_URL is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update([timestamp, 'POST', path, body].join('\\n')).digest('hex');\n  return { url: baseUrl.replace(/\\/+$/, '') + path, body, timestamp, signature: `v2=${mac}` };\n}\n\n// Convex returns overdue loans a page at a time. The first run comes from a\n// trigger; later runs come from \"More pages?\" carrying the previous page's\n// asOf and nextCursor, so every page of one run uses the same date.\nconst MAX_PAGES = 50;\nif ($runIndex >= MAX_PAGES) {\n  throw new Error(`Overdue loans still had more pages after ${MAX_PAGES}; stopping instead of looping forever`);\n}\nconst previous = $input.first().json;\nconst payload = previous.nextCursor ? { asOf: previous.asOf, cursor: previous.nextCursor } : {};\nreturn [{ json: signForLendLoop('/n8n/overdue-loans', payload) }];\n"
       },
       "id": "9fd1cfec-9697-526a-b775-7fba9d8ae876",
       "name": "Sign overdue query",
@@ -50,7 +50,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.CONVEX_SITE_URL }}/n8n/overdue-loans",
+        "url": "={{ $json.url }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -86,7 +86,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// One item per overdue loan. Convex already excluded loans reminded today.\nconst { loans = [] } = $input.first().json;\nreturn loans.map((loan) => ({ json: loan }));\n"
+        "jsCode": "// One item per overdue loan on this page. Convex already excluded loans\n// reminded today, and recorded loans with no verified email as failed\n// reminders (they show on the admin page), so only the count arrives here.\nconst { loans = [], undeliverable = 0 } = $input.first().json;\nif (undeliverable > 0) {\n  console.log(`[lendloop] ${undeliverable} overdue loan(s) have no verified email; recorded as failed reminders`);\n}\nreturn loans.map((loan) => ({ json: loan }));\n"
       },
       "id": "b3646741-8542-5982-bc86-5a85bafb4a9d",
       "name": "One item per loan",
@@ -112,7 +112,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}.${body}`, verified by convex/http.ts.\nfunction signForLendLoop(payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update(`${timestamp}.${body}`).digest('hex');\n  return { body, timestamp, signature: `v1=${mac}` };\n}\n\n// reminderKey makes the write-back idempotent: retries can't duplicate it.\nreturn $input.all().map(({ json: r }) => ({\n  json: signForLendLoop({\n    loanId: r.loanId,\n    reminderKey: r.reminderKey,\n    status: r.status,\n    channel: r.channel,\n    ...(r.detail ? { detail: r.detail } : {}),\n  }),\n}));\n"
+        "jsCode": "const crypto = require('crypto');\n\n// HMAC-SHA256 over `${timestamp}\\n${method}\\n${path}\\n${body}`, verified by\n// convex/http.ts. The path is part of the MAC, so the signature is only valid\n// for the endpoint it was made for. The HTTP node posts to the returned `url`,\n// so the path signed and the path called can't drift apart.\nfunction signForLendLoop(path, payload) {\n  const secret = $env.N8N_TO_LENDLOOP_SECRET;\n  const baseUrl = $env.CONVEX_SITE_URL;\n  if (!secret) throw new Error('N8N_TO_LENDLOOP_SECRET is not configured');\n  if (!baseUrl) throw new Error('CONVEX_SITE_URL is not configured');\n  const body = JSON.stringify(payload);\n  const timestamp = String(Math.floor(Date.now() / 1000));\n  const mac = crypto.createHmac('sha256', secret).update([timestamp, 'POST', path, body].join('\\n')).digest('hex');\n  return { url: baseUrl.replace(/\\/+$/, '') + path, body, timestamp, signature: `v2=${mac}` };\n}\n\n// reminderKey makes the write-back idempotent: retries can't duplicate it.\nreturn $input.all().map(({ json: r }) => ({\n  json: signForLendLoop('/n8n/reminders', {\n    loanId: r.loanId,\n    reminderKey: r.reminderKey,\n    status: r.status,\n    channel: r.channel,\n    ...(r.detail ? { detail: r.detail } : {}),\n  }),\n}));\n"
       },
       "id": "3618407f-944b-5020-a161-203fbc707a93",
       "name": "Sign write-back",
@@ -126,7 +126,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "={{ $env.CONVEX_SITE_URL }}/n8n/reminders",
+        "url": "={{ $json.url }}",
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
@@ -159,6 +159,39 @@
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "a026cf11-1d58-5862-9cd8-d95aa6e70c21",
+              "leftValue": "={{ Boolean($json.nextCursor) }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f844d89a-aa38-5c30-9f5c-3b9ad800f549",
+      "name": "More pages?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        660,
+        520
+      ]
     }
   ],
   "connections": {
@@ -189,6 +222,11 @@
         [
           {
             "node": "One item per loan",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "More pages?",
             "type": "main",
             "index": 0
           }
@@ -237,6 +275,18 @@
             "index": 0
           }
         ]
+      ]
+    },
+    "More pages?": {
+      "main": [
+        [
+          {
+            "node": "Sign overdue query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
       ]
     }
   },

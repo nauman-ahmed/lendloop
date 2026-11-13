@@ -1,17 +1,20 @@
 "use client";
 
-import { useMutation, useQuery } from "convex/react";
+import { useMutation, usePaginatedQuery, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import {
   ActionButton,
   Card,
   EmptyState,
+  LoadMore,
   LoanStatusBadge,
   PageHeader,
   Spinner,
   TrustedBadge,
 } from "@/components/ui";
 import { describeActivity, formatRange, timeAgo } from "@/lib/format";
+
+const LISTINGS_PAGE_SIZE = 30;
 
 // The UI only shows this page to admins, but each query below also calls
 // requireAdmin on the server, so a non-admin visiting the URL gets nothing.
@@ -99,12 +102,16 @@ function Users() {
 }
 
 function AllListings() {
-  const tools = useQuery(api.tools.list, {});
+  const { results: tools, status, loadMore } = usePaginatedQuery(
+    api.tools.list,
+    {},
+    { initialNumItems: LISTINGS_PAGE_SIZE },
+  );
   const remove = useMutation(api.tools.remove);
   return (
     <section>
       <SectionTitle>All listings</SectionTitle>
-      {tools === undefined ? (
+      {status === "LoadingFirstPage" ? (
         <Spinner />
       ) : tools.length === 0 ? (
         <EmptyState>No listings.</EmptyState>
@@ -127,6 +134,7 @@ function AllListings() {
           ))}
         </Card>
       )}
+      <LoadMore status={status} loadMore={loadMore} pageSize={LISTINGS_PAGE_SIZE} />
     </section>
   );
 }

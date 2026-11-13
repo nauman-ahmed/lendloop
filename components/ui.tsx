@@ -1,5 +1,6 @@
 "use client";
 
+import type { PaginationStatus } from "convex/react";
 import { useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 import type { LoanStatus } from "@/convex/lib/constants";
 import { describeActivity, errorMessage } from "@/lib/format";
@@ -144,6 +145,26 @@ export function EmptyState({ children }: { children: ReactNode }) {
   return (
     <div className="rounded-xl border border-dashed border-stone-300 p-8 text-center text-sm text-stone-500">
       {children}
+    </div>
+  );
+}
+
+/** "Load more" for a usePaginatedQuery list; hidden once everything is loaded. */
+export function LoadMore({
+  status,
+  loadMore,
+  pageSize,
+}: {
+  status: PaginationStatus;
+  loadMore: (numItems: number) => void;
+  pageSize: number;
+}) {
+  if (status === "LoadingFirstPage" || status === "Exhausted") return null;
+  return (
+    <div className="mt-6 flex justify-center">
+      <Button variant="secondary" disabled={status === "LoadingMore"} onClick={() => loadMore(pageSize)}>
+        {status === "LoadingMore" ? "Loading…" : "Load more"}
+      </Button>
     </div>
   );
 }

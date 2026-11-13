@@ -2,9 +2,9 @@
 
 | | |
 | --- | --- |
-| **Date** | 12 November 2026 |
+| **Date** | 12 November 2026 (updated 13 November 2026) |
 | **Commit audited** | `7683698` (`main`) |
-| **Status** | Medium findings LL-01 to LL-04 **resolved and re-tested**; Low and Informational findings open (see [Remediation plan](#remediation-plan)) |
+| **Status** | Medium findings LL-01 to LL-04 and Low findings LL-05, LL-07 and LL-08 **resolved and re-tested**; the other Low and Informational findings are open (see [Remediation plan](#remediation-plan)) |
 | **Scope** | Next.js app (`app/`, `components/`, `lib/`, `middleware.ts`), Convex backend (`convex/`), n8n workflows and deployment (`n8n/`), dependencies (`package-lock.json`) |
 | **Out of scope** | Clerk, Convex and n8n platform internals; hosting and network configuration of a production deployment |
 
@@ -18,15 +18,16 @@ integration are signed.
 The findings are mostly hardening and operational issues around the n8n
 deployment, abuse prevention, and a few places where the design is weaker
 than the README's claims ("never fail silently", "nothing leaves n8n
-unverified"). All four Medium findings have since been fixed and re-tested;
-each one has a **Resolution** note below.
+unverified"). All four Medium findings have since been fixed and re-tested,
+and so have three of the Low findings (LL-05, LL-07, LL-08). Each fixed
+finding has a **Resolution** note below.
 
 | Severity | Count | IDs | Status |
 | --- | --- | --- | --- |
 | Critical | 0 | | |
 | High | 0 | | |
 | Medium | 4 | LL-01, LL-02, LL-03, LL-04 | **Resolved** |
-| Low | 7 | LL-05 to LL-11 | Open |
+| Low | 7 | LL-05 to LL-11 | LL-05, LL-07, LL-08 **resolved**; LL-06, LL-09, LL-10, LL-11 open |
 | Informational | 2 | LL-12, LL-13 | Open (LL-13 partly mitigated by the LL-01 fix) |
 
 Severity reflects likelihood × impact *for this application as deployed by
@@ -41,7 +42,7 @@ reasons in [LL-11](#ll-11) it is rated Low here.
   - a reminder workflow run twice;
   - a simulated channel outage to exercise retries and the error workflow.
 - **Targeted probes**: a throwaway `convex-test` case for cross-endpoint replay (LL-05), and a grep for HTML/JS injection sinks.
-- **Automated checks**: `npm audit`, `npm outdated`, TypeScript strict typecheck, ESLint, and the test suite (`npm test`: 25 tests at audit time, 32 after the Medium fixes).
+- **Automated checks**: `npm audit`, `npm outdated`, TypeScript strict typecheck, ESLint, and the test suite (`npm test`: 25 tests at audit time, 32 after the Medium fixes, 39 after the Low fixes).
 - **Secret scan**: every tracked file was searched for the values in the local `.env` files. None found.
 
 ---
@@ -192,6 +193,19 @@ side effects.
 - Sign `${timestamp}.${method}.${path}.${body}` and verify against the actual request path.
 - Use `.strict()` on endpoint schemas so unexpected keys are rejected.
 
+> **Resolution: resolved.**
+>
+> - Signatures are now `v2=HMAC_SHA256(secret, "<timestamp>\n<METHOD>\n<path>\n<body>")` in both directions (`convex/lib/signing.ts` and the three n8n workflows).
+>   - Each Convex endpoint verifies against the method and path it is registered under, not values read from the request.
+>   - The fields are separated by newlines rather than dots. A URL path can't contain a raw newline, so moving characters between path and body never produces the same signed string.
+>   - The n8n Code nodes return the URL they signed, and the HTTP Request nodes post to it, so the signed path and the called path can't drift apart.
+> - Endpoint bodies use `z.strictObject`: unknown keys return 400 instead of being dropped.
+> - **Verified** by three new tests (cross-endpoint replay returns 401, unknown keys return 400, the field separator) and live against n8n 2.47.5 and a local Convex backend:
+>   - the original probe (a body signed for `/n8n/reminders`, sent to `/n8n/overdue-loans`) now returns 401;
+>   - `v1` signatures are rejected in both directions;
+>   - a real loan request was delivered Convex → n8n with the new scheme (HTTP 200 on the first attempt), and the error workflow's signed report was recorded.
+> - **Deployment note:** `v1` signatures are no longer accepted, so Convex and the n8n workflows must be updated together.
+
 ### LL-06: Five-minute replay window on the Convex endpoints
 
 **Severity:** Low · **Location:** `convex/lib/signing.ts:11`, `convex/http.ts`
@@ -225,6 +239,20 @@ in depth if an XSS bug is introduced later.
 - `Referrer-Policy: strict-origin-when-cross-origin`;
 - HSTS in production.
 
+> **Resolution: resolved.**
+>
+> - `middleware.ts` enables Clerk's CSP support in **strict** mode: a fresh nonce per request plus `'strict-dynamic'`, so only nonced scripts (Next.js's and Clerk's) and the scripts they load can run. Injected inline or third-party scripts are blocked.
+>   - Clerk's defaults already allow its frontend API, images and bot protection.
+>   - Added: `connect-src` for the Convex HTTPS and WebSocket origin, `frame-ancestors 'none'`, `object-src 'none'` and `base-uri 'self'`.
+> - `<ClerkProvider dynamic>` moved from a client component into the root layout. Pages now render per request, so Next.js and Clerk can stamp the nonce on their `<script>` tags.
+> - `next.config.ts` adds `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, `X-Frame-Options: DENY`, a restrictive `Permissions-Policy`, and HSTS in production. It also drops `X-Powered-By`.
+> - **Verified** in a browser against the local backend, with a placeholder Clerk key:
+>   - all headers are present and every script tag carries the request's nonce;
+>   - the page hydrates and the Convex WebSocket connects with no CSP violations.
+>   - The first version kept `ClerkProvider` in a client component, and the CSP blocked Clerk's script. That's why it moved to the layout. Clerk's script tag now carries the nonce.
+> - **Not yet verified:** sign-in with real Clerk keys (the sign-in modal and Cloudflare bot protection). It is part of the signed-in UI walkthrough.
+> - **Trade-offs:** `script-src` keeps `'unsafe-inline'` only as a fallback for browsers without nonce support; browsers that support nonces ignore it. `style-src 'unsafe-inline'` remains, because Clerk injects styles at runtime.
+
 ### LL-08: Some automation gaps are silent, contrary to the design goal
 
 **Severity:** Low · **Location:** `convex/automation.ts:34`, `convex/automation.ts:22`, `convex/tools.ts` (`take(200)`)
@@ -239,6 +267,22 @@ noticing, which undermines the "failed runs are visible" requirement.
 
 - Record a `failed` reminder event (`detail: "no email on file"`) so it appears in the admin failure panel.
 - Paginate the overdue query in the workflow (cursor loop), and paginate catalogue queries in the UI.
+
+> **Resolution: resolved.**
+>
+> - **No email on file:** `/n8n/overdue-loans` records these loans as failed reminders (label `overdue_reminder:none`, detail "No verified email on file…").
+>   - They appear under **Admin → Automation failures** and on the loan card.
+>   - They are retried on every run until the borrower has a verified email.
+>   - Only loan ids reach this code path, so nothing about the borrower is sent to n8n.
+> - **Overdue paging:** the endpoint returns 100 loans per page plus a `nextCursor`.
+>   - A new **More pages?** node loops back with the cursor and the same `asOf` until the cursor is `null`.
+>   - A 50-page guard fails the run, and so reaches the error workflow, rather than looping forever.
+>   - Paging walks the index itself, so loans already reminded today never block the ones after them.
+> - **Catalogue paging:** `tools.listPublic` and `tools.list` use Convex `paginate`, with the page size capped at 50 on the server. The public page, Browse and the admin listing have a **Load more** button.
+> - **Verified** by four new tests and live:
+>   - tests: no-email loans recorded and visible to admins; 106 overdue loans walked across pages with none missed or repeated; catalogue paging; the page-size cap;
+>   - live, with the page size temporarily set to 2: the workflow walked 3 pages (2 + 2 + 1 loans) and recorded 5 reminders. A second run walked the same pages and sent nothing.
+> - **Still capped:** the admin views (latest 200 loans, 500 users) and a user's own listings (bounded by the 50-listing limit). These are display windows, not automation inputs.
 
 ### LL-09: n8n duplicate suppression is not atomic
 
@@ -255,6 +299,12 @@ impact, because Convex-side state is idempotent.
 
 **Recommendation:** use an atomic store for idempotency, such as a Redis
 `SET NX` or a Postgres unique insert keyed on `eventId` before sending.
+
+**Related (found while re-testing LL-05):** Convex deduplicates workflow
+errors by n8n execution id (`workflow_error:<id>`). Execution ids restart at
+1 when n8n's database is recreated (`docker compose down -v`). After a
+reset, a new failure that reuses an old id would be treated as a duplicate
+and not shown. Fix: include a per-instance id or the failure time in the key.
 
 ### LL-10: No account deletion or data retention
 
@@ -327,12 +377,13 @@ manager in production.
 | Public data minimisation | `listPublic` returns exactly `{id, name, category}` (test asserts the key set). |
 | No email leakage between users | Loan views use first names only (test: *loan views never expose the other party's email*). Admin views omit emails too. |
 | Minimal outbound payloads | The webhook body has the recipient's first name and email, the other party's first name and loan facts (test asserts the other party's email is absent). |
-| Integrity of Convex → n8n | HMAC-SHA256 over the raw bytes, constant-time compare, ±5 min window, dedup. Live test: valid → 200, replay → *duplicate*, bad, stale or tampered signature → 401. |
-| Integrity of n8n → Convex | Same scheme with a **separate** secret. Generic 401 for every verification failure, zod validation after verification (tests). |
+| Integrity of Convex → n8n | HMAC-SHA256 over the method, path and raw bytes, constant-time compare, ±5 min window, dedup. Live test: valid → 200, replay → *duplicate*, bad, stale, tampered or wrong-path signature → 401. |
+| Integrity of n8n → Convex | Same scheme with a **separate** secret, verified against each endpoint's own path. Generic 401 for every verification failure, strict zod validation after verification (tests). |
 | Idempotent write-backs | `reminderKey` and `executionId` keys. Live test: second reminder run → nothing to do. Tests: *created* then *duplicate*. A key can't be written against another loan (422). |
 | Reliable delivery | Transactional outbox, retries with backoff (10 s → 30 min, 5 attempts), no retry on 4xx, failures shown to admins. Live outage test recovered on attempt 3. |
 | Race safety | Convex mutations are serializable transactions, so two simultaneous approvals of overlapping loans can't both commit. |
-| XSS | No `dangerouslySetInnerHTML`, `innerHTML`, `eval` or `new Function`. All output goes through React escaping. |
+| XSS | No `dangerouslySetInnerHTML`, `innerHTML`, `eval` or `new Function`. All output goes through React escaping. A strict nonce-based CSP blocks injected scripts as a second layer (LL-07). |
+| Clickjacking | CSP `frame-ancestors 'none'` plus `X-Frame-Options: DENY` (LL-07). |
 | CSRF | Convex calls carry a bearer JWT over WebSocket or `fetch`, not ambient cookies, so cross-site requests can't act as the user. |
 | Secrets hygiene | `.env*` files are git-ignored except the templates. Exported workflows reference `$env` names only. Secret scan of tracked files: clean. |
 | Input validation | Convex validators on every argument: enums, string length caps, strict calendar-date parsing, 30-day loans, 90-day booking horizon. |
@@ -341,7 +392,7 @@ manager in production.
 
 | Function | Who may call | Check |
 | --- | --- | --- |
-| `tools.listPublic` | anyone | Public by design; returns name + category only |
+| `tools.listPublic` | anyone | Public by design; returns name + category only, at most 50 per page |
 | `users.me` | anyone | Returns the caller's own record or `null` |
 | `users.ensureViewer` | signed-in | Identity required; can't set role |
 | `tools.list`, `tools.mine` | signed-in | `requireViewer` |
@@ -354,7 +405,7 @@ manager in production.
 | `loans.myRequests` / `incoming` | signed-in | Filtered by the caller's id through an index |
 | `admin.*` (public) | admin | `requireAdmin` |
 | `admin.setRole`, `automation.*`, `notifications.*`, `seed.*` | deployment credentials only | `internal*` functions |
-| `POST /n8n/*` | n8n | HMAC signature (see LL-05, LL-06) |
+| `POST /n8n/*` | n8n | HMAC signature bound to the endpoint's method and path (LL-05, resolved); 5-minute replay window (LL-06) |
 
 ---
 
@@ -363,5 +414,6 @@ manager in production.
 | Priority | Findings | Status |
 | --- | --- | --- |
 | Before any public deployment | LL-01 (secret-file key, owner-only editors), LL-02 (gateway exposes only the webhook), LL-03 (abuse limits), LL-04 (fail-closed email, `setRole` by id) | **Done** |
-| Next iteration | LL-05 + LL-06 (path-bound signatures, nonce cache), LL-07 (security headers), LL-08 (record skipped reminders, paginate) | Open, 1–2 days |
+| Next iteration | LL-05 (path-bound signatures, strict schemas), LL-07 (strict CSP and security headers), LL-08 (failed reminders recorded, overdue and catalogue paging) | **Done** |
+| Next iteration | LL-06 (nonce cache for the Convex endpoints) | Open, about half a day |
 | Planned | LL-09 (atomic dedupe store), LL-10 (deletion webhook, retention job), LL-11 (Next 16 upgrade), LL-12, LL-13 | Open, part of production hardening |

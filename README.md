@@ -166,7 +166,10 @@ docker compose -f n8n/docker-compose.yml up -d
 ```
 
 On first start a one-shot `n8n-import` container imports **and publishes** the
-three workflows from `n8n/workflows/`. Open <http://localhost:5678> and create
+three workflows from `n8n/workflows/`. It runs once per volume. To pick up
+changed workflow files later, recreate the volume with
+`docker compose -f n8n/docker-compose.yml down -v` (this also deletes n8n's
+execution history and owner account). Open <http://localhost:5678> and create
 the n8n owner account. Keep it the only account that can edit workflows (see
 [Security of the integration](#security-of-the-integration)).
 
@@ -312,7 +315,7 @@ ended before today" directly.
 | Workflow | Trigger | Steps |
 | --- | --- | --- |
 | **LendLoop: loan event notifications** | Webhook `POST /webhook/lendloop-loan-events` (raw body kept) | Verify HMAC and timestamp → drop already-delivered `eventId`s → compose message → send (mock channel) → remember `eventId` → respond 200. Invalid signature → 401. |
-| **LendLoop: overdue reminders** | Schedule, daily 09:00 (plus a manual "Run now" trigger) | Sign → `POST /n8n/overdue-loans` → one item per loan → send reminder (mock; per-item try/catch) → sign → `POST /n8n/reminders` with `sent` or `failed`. |
+| **LendLoop: overdue reminders** | Schedule, daily 09:00 (plus a manual "Run now" trigger) | Sign → `POST /n8n/overdue-loans` (one page) → one item per loan → send reminder (mock; per-item try/catch) → sign → `POST /n8n/reminders` with `sent` or `failed`. **More pages?** loops back with the cursor until there are no more pages (at most 50). |
 | **LendLoop: error handler** | Error Trigger (both workflows set it as their `errorWorkflow`) | Summarise, redact emails, sign → `POST /n8n/workflow-errors`. |
 
 The notification channel is a **logged mock**: it logs a masked address and
@@ -328,8 +331,9 @@ change. The composed message already contains only what the recipient needs.
 2. The scheduler runs `notifications.deliver`. It builds a **minimal**
    payload (recipient's first name and email, the other party's first name,
    tool name, dates, status) and POSTs it with:
-   `x-lendloop-timestamp`, `x-lendloop-signature: v1=HMAC_SHA256(secret, "<ts>.<body>")`,
-   `idempotency-key: <eventId>`. The request times out after 10 s.
+   `x-lendloop-timestamp`, `x-lendloop-signature: v2=HMAC_SHA256(secret, "<ts>\n<METHOD>\n<path>\n<body>")`,
+   `idempotency-key: <eventId>`. The request times out after 10 s. The
+   same scheme, with the other secret, signs every n8n → Convex call.
 3. **Retries:** 5xx, 408, 429 and network errors are retried after 10 s,
    1 min, 5 min and 30 min (5 attempts). Other 4xx responses (e.g. a bad
    signature) aren't retried. After the last attempt the event is marked
@@ -345,6 +349,13 @@ change. The composed message already contains only what the recipient needs.
   today. Each comes with a `reminderKey` of `reminder:<loanId>:<YYYY-MM-DD>`
   and only the fields a reminder needs. **Loans already reminded today are
   excluded**, so re-running the workflow is harmless.
+- It returns **one page** (100 loans) and a `nextCursor`. The workflow sends
+  the cursor back with the same `asOf` until the cursor is `null`, so no
+  loan is dropped however many are overdue.
+- A loan whose borrower has **no verified email** can't be reminded. Convex
+  records it as a failed reminder ("No verified email on file") instead of
+  skipping it, so it shows on the admin page and the loan card. Only the
+  count reaches n8n.
 - `POST /n8n/reminders` is an **idempotent upsert** keyed by `reminderKey`.
   It returns `created`, `updated` (a failed attempt later succeeded) or
   `duplicate` (already succeeded, so it does nothing). The key must belong
@@ -365,7 +376,8 @@ change. The composed message already contains only what the recipient needs.
 
 - **Two secrets, one per direction.** A leak on one side doesn't let an attacker forge the other.
 - Signatures cover a timestamp, which limits replay to a 5-minute window. n8n deduplicates `eventId`s and Convex is idempotent, so a replay inside the window changes nothing.
-- Convex's endpoints return a generic 401 and log the specific reason only server-side. Bodies are validated with zod after verification.
+- Signatures also cover the **method and path**. A request signed for one endpoint is rejected by every other endpoint, even one that shares the secret. Each side checks against the path it serves, not the path in the request.
+- Convex's endpoints return a generic 401 and log the specific reason only server-side. Bodies are validated with **strict** zod schemas after verification, so unexpected keys are rejected (400) rather than silently dropped.
 - Secrets live in Convex env vars and `n8n/.env`. Code nodes read the two HMAC secrets via `$env`, so the exported JSON has none. In n8n 2.x this needs `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`, which lets anyone who can *edit* workflows read those two values. Keep workflow-edit rights to the owner account.
 - n8n's credential-encryption key is **not** in the environment. It's a Docker secret file (`N8N_ENCRYPTION_KEY_FILE`). Verified with a probe workflow: `$env` doesn't expose it, the Read/Write Files node is refused access to the file, and `require('fs')` is disallowed in Code nodes.
 - Only the webhook is public. n8n binds to localhost, and the Caddy gateway forwards nothing but `POST /webhook/lendloop-loan-events`, with a 64 KB body cap.
@@ -382,6 +394,8 @@ change. The composed message already contains only what the recipient needs.
 - **Abuse limits** on requests and listings (see [What it does](#what-it-does)) stop one account from flooding a lender with notifications.
 - **Input validation:** Convex validators on every argument, with length limits on text, strict calendar-date parsing, and enum categories, conditions and roles.
 - **Defence in depth:** Clerk middleware protects `/dashboard`, but every function also checks auth independently.
+- **Browser hardening:** a strict Content-Security-Policy with a fresh nonce per request (`'strict-dynamic'`), set by Clerk's middleware and extended with the Convex origins. Only Next.js's and Clerk's own scripts can run. `frame-ancestors 'none'` and `X-Frame-Options: DENY` stop clickjacking of buttons like Approve and Remove. Also `nosniff`, a strict `Referrer-Policy`, a restrictive `Permissions-Policy`, and HSTS in production.
+- **Bounded reads:** the catalogue is paged, with the page size capped at 50 on the server, so one request can't make Convex read the whole table.
 - **Supply chain / runtime:** React pinned to a patched 19.1.x. The n8n image is pinned to a fixed version and n8n is bound to `127.0.0.1` in compose. n8n telemetry is off.
 
 ---
@@ -389,7 +403,7 @@ change. The composed message already contains only what the recipient needs.
 ## Testing
 
 ```bash
-npm test            # 32 tests: unit (dates, HMAC) + convex-test integration
+npm test            # 39 tests: unit (dates, HMAC) + convex-test integration
 ```
 
 ```bash
@@ -403,22 +417,24 @@ npm run lint
 The integration suite (`convex/lendloop.test.ts`) runs the real Convex
 functions in memory as different identities. It covers:
 
-- The public query exposes only name and category.
+- The public query exposes only name and category. The catalogue is paged, every tool is reachable through the cursor, and the page size is capped.
 - Signed-out callers are rejected.
 - Users can't edit, delete or act on others' listings and loans. Admins can remove any listing. Users can't self-promote, and admin functions reject users.
 - The lifecycle rules work: double booking is blocked, overlapping requests are auto-declined, and you can't borrow your own tool.
 - Loan views never contain emails.
 - Emails are stored only when verified (a missing claim counts as unverified), and roles are granted by user id.
 - Abuse limits: hourly and open-request caps per borrower, a per-tool pending cap across accounts, and hourly and total listing caps.
-- Each transition sends exactly one **signed** webhook with a minimal payload.
+- Each transition sends exactly one **signed** webhook with a minimal payload, and the signature is bound to the webhook path.
 - 5xx responses are retried 5× then marked failed and shown to admins. 4xx responses aren't retried.
-- n8n endpoints reject bad signatures. The overdue list is minimal, and reminder write-backs are idempotent and scoped to their loan.
+- n8n endpoints reject bad signatures, signatures made for another endpoint, and bodies with unexpected keys. The overdue list is minimal, and reminder write-backs are idempotent and scoped to their loan.
+- Overdue loans are paged with a cursor: 106 loans are walked with none missed or repeated. Loans whose borrower has no email are recorded as failed reminders and shown to admins.
 - Workflow errors are deduplicated.
 
 I also ran the whole loop against a real n8n 2.47.5 container:
 
-- **Signed webhook:** 200. **Replay:** "duplicate". **Bad, stale or tampered signature:** 401.
-- **Reminders, run twice:** created, then nothing to do.
+- **Signed webhook:** 200. **Replay:** "duplicate". **Bad, stale or tampered signature:** 401. **Signature made for another path, or an old `v1` signature:** 401, in both directions.
+- **Reminders, run twice:** created, then nothing to do. With the page size temporarily set to 2, the workflow walked 3 pages (2 + 2 + 1 loans) and the second run walked them again without sending anything.
+- **CSP:** in a browser, every script tag carries the request's nonce, and the page hydrates and talks to Convex with no CSP violations.
 - **Simulated outage:** Convex retries and the error workflow records each failed run. Recovery happens on the next retry.
 - **Webhook gateway:** the signed webhook passes. The editor, `/rest`, `/api`, other webhooks, `/webhook-test` and `../` traversal all return 404, and a 70 KB body returns 413.
 - **Secret isolation:** a probe Code node can't see the encryption key in `$env`, can't read its file with the Read/Write Files node, and can't load `fs`.
@@ -430,7 +446,8 @@ I also ran the whole loop against a real n8n 2.47.5 container:
 **Secrets and keys**
 
 - Move the two HMAC secrets from `$env` to n8n **External Secrets** (Vault / AWS Secrets Manager) and re-enable `N8N_BLOCK_ENV_ACCESS_IN_NODE`.
-- Rotate the HMAC secrets on a schedule. Support two active keys during rotation (`v1=` and `v2=` signatures).
+- Rotate the HMAC secrets on a schedule. Support two active keys during rotation, with a key id in the signature header.
+- Add a nonce cache on the Convex endpoints so a captured request can't be replayed even inside the 5-minute window (audit finding LL-06).
 
 **n8n**
 
@@ -445,7 +462,8 @@ I also ran the whole loop against a real n8n 2.47.5 container:
 
 **Data and scale**
 
-- Paginate queries (Convex `paginate`) instead of capped `take(200)`. Denormalise tool availability onto `tools` if the catalogue grows.
+- Page the admin views too (they show the latest 200 loans and 500 users). Denormalise tool availability onto `tools` if the catalogue grows: the public catalogue skips on-loan tools after reading each page, so pages can come back short.
+- Add a CSP `report-to` endpoint to collect violation reports.
 - Retention policy for `automationEvents` and loan history, plus user data export and deletion (GDPR/CCPA). Handle Clerk `user.deleted` webhooks to anonymise users.
 
 **Abuse and auditing**

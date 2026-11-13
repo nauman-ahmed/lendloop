@@ -1,3 +1,4 @@
+import { ClerkProvider } from "@clerk/nextjs";
 import type { Metadata } from "next";
 import { Geist } from "next/font/google";
 import { Providers } from "@/components/Providers";
@@ -18,11 +19,16 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // `dynamic` renders every page per request. The CSP nonce from middleware.ts
+  // is new each time, and both Next.js and Clerk need it on their <script> tags,
+  // which only happens when rendering live.
   return (
-    <html lang="en">
-      <body className={`${geistSans.variable} antialiased`}>
-        <Providers>{children}</Providers>
-      </body>
-    </html>
+    <ClerkProvider dynamic>
+      <html lang="en">
+        <body className={`${geistSans.variable} antialiased`}>
+          <Providers>{children}</Providers>
+        </body>
+      </html>
+    </ClerkProvider>
   );
 }

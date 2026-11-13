@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation, useQuery } from "convex/react";
+import { useMutation, usePaginatedQuery } from "convex/react";
 import { useState, type FormEvent } from "react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
@@ -15,6 +15,7 @@ import {
   Button,
   Card,
   EmptyState,
+  LoadMore,
   PageHeader,
   Spinner,
   TrustedBadge,
@@ -22,9 +23,15 @@ import {
 } from "@/components/ui";
 import { errorMessage, formatRange, todayIso } from "@/lib/format";
 
+const PAGE_SIZE = 20;
+
 export default function BrowsePage() {
   const [category, setCategory] = useState<Category | undefined>();
-  const tools = useQuery(api.tools.list, { category });
+  const { results: tools, status, loadMore } = usePaginatedQuery(
+    api.tools.list,
+    { category },
+    { initialNumItems: PAGE_SIZE },
+  );
 
   return (
     <>
@@ -40,7 +47,7 @@ export default function BrowsePage() {
         ))}
       </div>
 
-      {tools === undefined ? (
+      {status === "LoadingFirstPage" ? (
         <Spinner />
       ) : tools.length === 0 ? (
         <EmptyState>Nothing in this category yet.</EmptyState>
@@ -84,6 +91,7 @@ export default function BrowsePage() {
           ))}
         </div>
       )}
+      <LoadMore status={status} loadMore={loadMore} pageSize={PAGE_SIZE} />
     </>
   );
 }

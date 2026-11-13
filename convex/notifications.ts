@@ -8,7 +8,7 @@ import {
   type MutationCtx,
 } from "./_generated/server";
 import { displayName } from "./lib/auth";
-import { signPayload } from "./lib/signing";
+import { signRequest } from "./lib/signing";
 
 // Convex -> n8n "request notification" pipeline.
 //
@@ -120,12 +120,14 @@ export const deliver = internalAction({
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
+      // The signature covers the webhook path, so it is only valid for this endpoint.
+      const signature = await signRequest(secret, { method: "POST", path: new URL(url).pathname, body });
       const response = await fetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           "idempotency-key": payload.eventId,
-          ...(await signPayload(secret, body)),
+          ...signature,
         },
         body,
         signal: controller.signal,
