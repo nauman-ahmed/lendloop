@@ -11,6 +11,20 @@ everything n8n sends back to it.
 
 ---
 
+## Screenshots
+
+| Public page | Browse tools |
+| --- | --- |
+| ![Public page: tagline and the tools available right now, name and category only](docs/screenshots/public-home.jpg) | ![Browse: availability badges, category filter, request to borrow](docs/screenshots/browse.jpg) |
+| **Incoming requests** | **Admin** |
+| ![Incoming requests: each loan lists the n8n notifications sent for it](docs/screenshots/incoming-requests.jpg) | ![Admin: failed automation runs, Trusted Lender controls](docs/screenshots/admin.jpg) |
+
+Every loan card shows its automation activity ("Notified (approved) 6 minutes
+ago", "Overdue reminder sent"). The admin page lists failed n8n runs; the three
+shown come from the simulated-outage test.
+
+---
+
 ## Contents
 
 1. [What it does](#what-it-does)
