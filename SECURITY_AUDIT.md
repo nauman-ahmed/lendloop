@@ -32,7 +32,7 @@ finding has a **Resolution** note below.
 
 Severity reflects likelihood × impact *for this application as deployed by
 the README*. The dependency scan reports one "high" advisory; for the
-reasons in [LL-11](#ll-11) it is rated Low here.
+reasons in [LL-11](#ll-11-dependency-advisories-build--and-dev-time-only) it is rated Low here.
 
 ## Methodology
 
